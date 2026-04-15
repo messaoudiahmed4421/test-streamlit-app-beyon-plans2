@@ -1,29 +1,27 @@
 """
-Real Tools module extracted from notebook for ADK agents - implements all callable functions.
+Pipeline Tools — Real financial analysis functions extracted from colab x vscode.ipynb.
+Adapted for Streamlit Cloud (reads uploaded files instead of local paths).
 """
 from __future__ import annotations
 
 import json
-from io import StringIO
-from io import BytesIO
+import re
 import traceback as _tb
+from collections import Counter as _Ctr
+from io import BytesIO, StringIO, StringIO as _SIO
 from typing import Any, Callable, Dict, List
 
-import pandas as pd
 import numpy as _np
 import networkx as nx
-import re
+import pandas as pd
 
 import logging
 logger = logging.getLogger(__name__)
 
-# To support the ToolContext types used in notebook code
-class FakeToolContext:
-    pass
+# ToolContext is provided by google.adk at runtime; use Any for type hints
 ToolContext = Any
 
-
-
+# ═══ Constants ═══════════════════════════════════════════════════════════
 MONTH_COLS = ["jan", "fev", "mar", "avr", "mai", "jun",
               "jul", "aou", "sep", "oct", "nov", "dec"]
 
@@ -33,11 +31,9 @@ A1_REQUIRED_COLS: Dict[str, List[str]] = {
     "mapping": ["code", "parent_code", "libelle", "classe", "categorie_analyse"],
 }
 
-# ── Lignes d'agrégats à exclure de l'analyse ligne-à-ligne ───────────────
 AGGREGATE_CODES = {"TOTAL_CHARGES", "EBITDA", "RÉSULTAT_NET"}
 
 MATERIALITY_THRESHOLD = 0.02
-
 VARIANCE_THRESHOLD_PCT = 15.0
 
 def _clean_numeric_value(val) -> float:
@@ -63,6 +59,13 @@ def _clean_numeric_value(val) -> float:
     except ValueError:
         return 0.0
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TOOL : normalize_pnl_files
+# ════════════════════════════════════════════════════════════════════════════
+
+
+
 def _to_native(obj):
     if isinstance(obj, dict):
         return {k: _to_native(v) for k, v in obj.items()}
@@ -79,28 +82,7 @@ def _to_native(obj):
     return obj
 
 
-def _safe_repr(obj) -> str:
-    try:
-        if isinstance(obj, pd.DataFrame):
-            return f"DataFrame({len(obj)} rows, cols={list(obj.columns)})"
-        s = str(obj)
-        return s[:200] if len(s) > 200 else s
-    except Exception:
-        return "<non-representable>"
 
-
-def _gen_fn(fn_name: str, fn_body: Callable, log: list, **kwargs) -> Any:
-    entry = {"function": fn_name, "args": {k: _safe_repr(v) for k, v in kwargs.items()}}
-    try:
-        result = fn_body(**kwargs)
-        entry["status"] = "ok"
-        entry["result_preview"] = _safe_repr(result)
-    except Exception as exc:
-        entry["status"] = "error"
-        entry["error"] = str(exc)
-        result = None
-    log.append(entry)
-    return result
 
 def _safe_repr(obj) -> str:
     try:
@@ -112,18 +94,7 @@ def _safe_repr(obj) -> str:
         return "<non-representable>"
 
 
-def _gen_fn(fn_name: str, fn_body: Callable, log: list, **kwargs) -> Any:
-    entry = {"function": fn_name, "args": {k: _safe_repr(v) for k, v in kwargs.items()}}
-    try:
-        result = fn_body(**kwargs)
-        entry["status"] = "ok"
-        entry["result_preview"] = _safe_repr(result)
-    except Exception as exc:
-        entry["status"] = "error"
-        entry["error"] = str(exc)
-        result = None
-    log.append(entry)
-    return result
+
 
 def _gen_fn(fn_name: str, fn_body: Callable, log: list, **kwargs) -> Any:
     entry = {"function": fn_name, "args": {k: _safe_repr(v) for k, v in kwargs.items()}}
@@ -144,858 +115,7 @@ def _gen_fn(fn_name: str, fn_body: Callable, log: list, **kwargs) -> Any:
 #  Phases 1 & 2 — Decorticage + Scoring (TOUTES les anomalies, pas de filtre)
 # ════════════════════════════════════════════════════════════════════════════
 
-def analyze_pnl_variances(tool_context: ToolContext) -> dict:
-    """Analyse P&L robuste : decorticage + scoring 5 axes. AUCUN filtre.
 
-    Retourne TOUTES les anomalies scorees avec une suggestion :
-      fortement_recommande / a_evaluer / probablement_negligeable
-    C est au LLM de decider RETENIR ou ECARTER chacune.
-    """
-    execution_log: list = []
-
-    # ── 0. Precondition ───────────────────────────────────────────────
-    a2_output = tool_context.state.get("a2_output")
-    if not a2_output or a2_output.get("status") != "success":
-        result = {
-            "status": "error",
-            "stage": "precondition_check",
-            "errors": ["a2_output absent ou en erreur."],
-        }
-        tool_context.state["a3_output"] = result
-        return result
-
-    try:
-        # ── 1. Charger DataFrames ─────────────────────────────────────
-        budget_df = _gen_fn(
-            "load_budget", lambda: pd.read_json(
-                _SIO(a2_output["normalized_budget"]), orient="records"
-            ), execution_log
-        )
-        actual_df = _gen_fn(
-            "load_actual", lambda: pd.read_json(
-                _SIO(a2_output["normalized_actual"]), orient="records"
-            ), execution_log
-        )
-        mapping_df = _gen_fn(
-            "load_mapping",
-            lambda: pd.read_json(
-                _SIO(a2_output.get("classified_actual", "[]")), orient="records"
-            )[["code", "parent_code"]].drop_duplicates()
-            if "classified_actual" in a2_output
-            else pd.DataFrame(columns=["code", "parent_code"]),
-            execution_log,
-        )
-
-        for df in [budget_df, actual_df]:
-            df["code"] = df["code"].astype(str).str.strip()
-        mapping_df["code"] = mapping_df["code"].astype(str).str.strip()
-        if "parent_code" in mapping_df.columns:
-            mapping_df["parent_code"] = mapping_df["parent_code"].astype(str).str.strip()
-
-        # ── 2. Agreger totaux annuels ─────────────────────────────────
-        month_cols = [c for c in MONTH_COLS if c in budget_df.columns]
-        total_col = "total" if "total" in budget_df.columns else None
-
-        def _aggregate_totals(df, label):
-            if total_col and total_col in df.columns:
-                agg = df.groupby("code", as_index=False)[total_col].sum()
-                agg.rename(columns={total_col: f"total_{label}"}, inplace=True)
-            else:
-                df_m = df.copy()
-                df_m["_sum"] = df_m[month_cols].sum(axis=1)
-                agg = df_m.groupby("code", as_index=False)["_sum"].sum()
-                agg.rename(columns={"_sum": f"total_{label}"}, inplace=True)
-            return agg
-
-        budget_agg = _gen_fn("aggregate_budget",
-            lambda: _aggregate_totals(budget_df, "budget"), execution_log)
-        actual_agg = _gen_fn("aggregate_actual",
-            lambda: _aggregate_totals(actual_df, "actual"), execution_log)
-
-        # ── 3. Fusionner ──────────────────────────────────────────────
-        merged = _gen_fn("merge_budget_actual",
-            lambda: budget_agg.merge(actual_agg, on="code", how="outer").fillna(0.0),
-            execution_log)
-        merged = _gen_fn("attach_hierarchy",
-            lambda: merged.merge(
-                mapping_df[["code", "parent_code"]].drop_duplicates(),
-                on="code", how="left"),
-            execution_log)
-
-        # ── 3b. Parents manquants ─────────────────────────────────────
-        a1_data = tool_context.state.get("a1_output")
-        if a1_data and "normalized_mapping" in a1_data:
-            full_hier = _gen_fn("load_full_hierarchy",
-                lambda: pd.read_json(
-                    _SIO(a1_data["normalized_mapping"]), orient="records"
-                )[["code", "parent_code"]].drop_duplicates(),
-                execution_log)
-            full_hier["code"] = full_hier["code"].astype(str).str.strip()
-            full_hier["parent_code"] = full_hier["parent_code"].astype(str).str.strip()
-        else:
-            full_hier = mapping_df[["code", "parent_code"]].copy()
-
-        def _insert_missing_parents(df, hierarchy):
-            out = df.copy()
-            hier_map = dict(zip(
-                hierarchy["code"].astype(str).str.strip(),
-                hierarchy["parent_code"].astype(str).str.strip()))
-            existing = set(out["code"].astype(str).str.strip())
-            while True:
-                referenced = set()
-                for _, r in out.iterrows():
-                    pc = str(r["parent_code"]).strip()
-                    c = str(r["code"]).strip()
-                    if pc and pc != c and pc.upper() not in ("NAN", "NULL", "NONE", ""):
-                        referenced.add(pc)
-                missing = referenced - existing
-                if not missing:
-                    break
-                new_rows = []
-                for code in missing:
-                    new_rows.append({
-                        "code": code, "total_budget": 0.0, "total_actual": 0.0,
-                        "parent_code": hier_map.get(code, code),
-                        "variance": 0.0, "pct_variance": None,
-                        "new_or_unplanned_activity": False,
-                    })
-                out = pd.concat([out, pd.DataFrame(new_rows)], ignore_index=True)
-                existing.update(missing)
-            return out
-
-        merged = _gen_fn("insert_missing_parents",
-            lambda: _insert_missing_parents(merged, full_hier), execution_log)
-
-        # ── 4. Variance feuille ───────────────────────────────────────
-        def _compute_leaf_variance(df):
-            out = df.copy()
-            out["variance"] = out["total_actual"] - out["total_budget"]
-            out["pct_variance"] = out.apply(
-                lambda r: round(float(r["variance"] / r["total_budget"]) * 100, 4)
-                if r["total_budget"] != 0 else None, axis=1)
-            out["new_or_unplanned_activity"] = (
-                (out["total_budget"] == 0) & (out["total_actual"] != 0))
-            return out
-
-        merged = _gen_fn("compute_leaf_variance",
-            lambda: _compute_leaf_variance(merged), execution_log)
-
-        # ── 5. Niveaux hierarchiques ──────────────────────────────────
-        def _assign_levels(df):
-            out = df.copy()
-            code_to_parent = dict(zip(out["code"], out["parent_code"].fillna("")))
-            def _level(code, visited=None):
-                if visited is None:
-                    visited = set()
-                if code in visited:
-                    return 0
-                visited.add(code)
-                parent = str(code_to_parent.get(code, "")).strip()
-                if not parent or parent == code or parent.upper() in ("NAN", "NULL", "NONE", ""):
-                    return 0
-                return 1 + _level(parent, visited)
-            out["level"] = out["code"].apply(_level)
-            return out
-
-        merged = _gen_fn("assign_hierarchy_levels",
-            lambda: _assign_levels(merged), execution_log)
-
-        # ── 6. Rollup ascendant multi-niveaux ─────────────────────────
-        def _rollup(df):
-            out = df.copy()
-            max_level = int(out["level"].max()) if len(out) > 0 else 0
-            for current_level in range(max_level, 0, -1):
-                children = out[out["level"] == current_level]
-                parent_sums = {}
-                for _, row in children.iterrows():
-                    pc = str(row["parent_code"]).strip()
-                    c = str(row["code"]).strip()
-                    if pc and pc != c and pc.upper() not in ("NAN", "NULL", "NONE", ""):
-                        if pc not in parent_sums:
-                            parent_sums[pc] = {"budget": 0.0, "actual": 0.0}
-                        parent_sums[pc]["budget"] += float(row["total_budget"])
-                        parent_sums[pc]["actual"] += float(row["total_actual"])
-                for idx, row in out.iterrows():
-                    code = str(row["code"]).strip()
-                    if code in parent_sums:
-                        out.at[idx, "total_budget"] = parent_sums[code]["budget"]
-                        out.at[idx, "total_actual"] = parent_sums[code]["actual"]
-            out["variance"] = out["total_actual"] - out["total_budget"]
-            out["pct_variance"] = out.apply(
-                lambda r: round(float(r["variance"] / r["total_budget"]) * 100, 4)
-                if r["total_budget"] != 0 else None, axis=1)
-            out["new_or_unplanned_activity"] = (
-                (out["total_budget"] == 0) & (out["total_actual"] != 0))
-            return out
-
-        merged = _gen_fn("rollup_ascendant",
-            lambda: _rollup(merged), execution_log)
-
-        # ── 7. Validation rollup ──────────────────────────────────────
-        def _validate_rollup(df):
-            roots = df[df["level"] == 0]
-            parent_codes_set = set()
-            for _, row in df.iterrows():
-                pc = str(row["parent_code"]).strip()
-                c = str(row["code"]).strip()
-                if pc and pc != c and pc.upper() not in ("NAN", "NULL", "NONE", ""):
-                    parent_codes_set.add(pc)
-            all_codes = set(df["code"].astype(str).str.strip())
-            true_leaf_codes = all_codes - parent_codes_set
-            true_leaves = df[df["code"].isin(true_leaf_codes)]
-            root_budget = float(roots["total_budget"].sum())
-            root_actual = float(roots["total_actual"].sum())
-            leaf_budget = float(true_leaves["total_budget"].sum())
-            leaf_actual = float(true_leaves["total_actual"].sum())
-            tol = 0.01
-            budget_ok = abs(root_budget - leaf_budget) < tol or len(true_leaves) == 0
-            actual_ok = abs(root_actual - leaf_actual) < tol or len(true_leaves) == 0
-            return {
-                "root_budget": round(root_budget, 2),
-                "root_actual": round(root_actual, 2),
-                "true_leaf_budget": round(leaf_budget, 2),
-                "true_leaf_actual": round(leaf_actual, 2),
-                "root_count": len(roots),
-                "true_leaf_count": len(true_leaves),
-                "coherent": bool(budget_ok and actual_ok),
-            }
-
-        validation = _gen_fn("validate_rollup",
-            lambda: _validate_rollup(merged), execution_log)
-
-        if not validation.get("coherent", False):
-            result = {
-                "status": "error", "stage": "rollup_validation",
-                "validation": validation, "execution_log": execution_log,
-            }
-            tool_context.state["a3_output"] = _to_native(result)
-            return _to_native(result)
-
-        # ── 8. Variance Drivers ───────────────────────────────────────
-        def _compute_drivers(df):
-            drivers = []
-            parents_with_children = {}
-            for _, row in df.iterrows():
-                pc = str(row["parent_code"]).strip()
-                c = str(row["code"]).strip()
-                if pc and pc != c and pc.upper() not in ("NAN", "NULL", "NONE", ""):
-                    parents_with_children.setdefault(pc, []).append(c)
-            for parent_code, children in parents_with_children.items():
-                parent_row = df[df["code"] == parent_code]
-                if parent_row.empty:
-                    continue
-                parent_variance = float(parent_row.iloc[0]["variance"])
-                if parent_variance == 0:
-                    continue
-                for child_code in children:
-                    child_row = df[df["code"] == child_code]
-                    if child_row.empty:
-                        continue
-                    child_variance = float(child_row.iloc[0]["variance"])
-                    contribution = round(
-                        (child_variance / parent_variance) * 100, 4
-                    ) if parent_variance != 0 else 0.0
-                    abs_c = abs(contribution)
-                    if abs_c >= 50:
-                        role = "primary"
-                    elif contribution < 0:
-                        role = "compensating"
-                    elif abs_c < 10:
-                        role = "marginal"
-                    else:
-                        role = "primary"
-                    drivers.append({
-                        "child_code": child_code,
-                        "parent_code": parent_code,
-                        "child_variance": round(child_variance, 2),
-                        "parent_variance": round(parent_variance, 2),
-                        "variance_contribution": round(contribution, 4),
-                        "driver_role": role,
-                    })
-            return drivers
-
-        drivers = _gen_fn("compute_variance_drivers",
-            lambda: _compute_drivers(merged), execution_log)
-
-        # ── 9. Variance tree ──────────────────────────────────────────
-        def _build_tree(df):
-            tree = []
-            for _, row in df.iterrows():
-                tree.append({
-                    "code": str(row["code"]),
-                    "parent_code": str(row.get("parent_code", "")),
-                    "level": int(row.get("level", 0)),
-                    "total_budget": round(float(row["total_budget"]), 2),
-                    "total_actual": round(float(row["total_actual"]), 2),
-                    "variance": round(float(row["variance"]), 2),
-                    "pct_variance": round(float(row["pct_variance"]), 4)
-                    if pd.notna(row.get("pct_variance")) else None,
-                    "new_or_unplanned_activity": bool(
-                        row.get("new_or_unplanned_activity", False)),
-                })
-            return tree
-
-        variance_tree = _gen_fn("build_variance_tree",
-            lambda: _build_tree(merged), execution_log)
-
-        # ══════════════════════════════════════════════════════════════
-        # ── 10. Ecarts mensuels ───────────────────────────────────────
-        # ══════════════════════════════════════════════════════════════
-
-        def _compute_monthly_variances(budget_raw, actual_raw, mcols):
-            monthly_vars = []
-            if not mcols:
-                return monthly_vars
-            b = budget_raw.copy()
-            a = actual_raw.copy()
-            b["code"] = b["code"].astype(str).str.strip()
-            a["code"] = a["code"].astype(str).str.strip()
-            codes = set(b["code"]) | set(a["code"])
-            for code in codes:
-                b_row = b[b["code"] == code]
-                a_row = a[a["code"] == code]
-                if b_row.empty and a_row.empty:
-                    continue
-                for m in mcols:
-                    bv = float(b_row[m].iloc[0]) if not b_row.empty and m in b_row.columns else 0.0
-                    av = float(a_row[m].iloc[0]) if not a_row.empty and m in a_row.columns else 0.0
-                    v = av - bv
-                    pct = round((v / bv) * 100, 2) if bv != 0 else None
-                    monthly_vars.append({
-                        "code": code, "month": m,
-                        "budget": round(bv, 2), "actual": round(av, 2),
-                        "variance": round(v, 2), "pct_variance": pct,
-                    })
-            return monthly_vars
-
-        monthly_variances = _gen_fn("compute_monthly_variances",
-            lambda: _compute_monthly_variances(budget_df, actual_df, month_cols),
-            execution_log)
-
-        # ══════════════════════════════════════════════════════════════
-        # ── 11. Detection anomalies (5 types) ─────────────────────────
-        # ══════════════════════════════════════════════════════════════
-
-        def _detect_anomalies(budget_raw, actual_raw, mcols):
-            anomalies = []
-            if not mcols:
-                return anomalies
-            b = budget_raw.copy()
-            a = actual_raw.copy()
-            b["code"] = b["code"].astype(str).str.strip()
-            a["code"] = a["code"].astype(str).str.strip()
-            codes = set(b["code"]) | set(a["code"])
-            for code in codes:
-                b_row = b[b["code"] == code]
-                a_row = a[a["code"] == code]
-                if b_row.empty and a_row.empty:
-                    continue
-                budget_vals = []
-                actual_vals = []
-                for m in mcols:
-                    bv = float(b_row[m].iloc[0]) if not b_row.empty and m in b_row.columns else 0.0
-                    av = float(a_row[m].iloc[0]) if not a_row.empty and m in a_row.columns else 0.0
-                    budget_vals.append(bv)
-                    actual_vals.append(av)
-                budget_arr = _np.array(budget_vals)
-                actual_arr = _np.array(actual_vals)
-                var_arr = actual_arr - budget_arr
-
-                # 1. Spikes mensuels (> 20%)
-                for i, m in enumerate(mcols):
-                    if budget_arr[i] != 0:
-                        pct = (var_arr[i] / budget_arr[i]) * 100
-                        if abs(pct) > 20:
-                            anomalies.append({
-                                "code": code, "type": "monthly_spike", "month": m,
-                                "budget": round(float(budget_arr[i]), 2),
-                                "actual": round(float(actual_arr[i]), 2),
-                                "variance": round(float(var_arr[i]), 2),
-                                "pct": round(float(pct), 2),
-                                "severity": "high" if abs(pct) > 50 else "medium",
-                            })
-
-                # 2. Tendance (regression)
-                if len(actual_arr) >= 6 and _np.std(actual_arr) > 0:
-                    x = _np.arange(len(actual_arr))
-                    slope = float(_np.polyfit(x, actual_arr, 1)[0])
-                    mean_val = float(_np.mean(actual_arr))
-                    if mean_val != 0 and abs(slope * 12 / mean_val) > 0.15:
-                        anomalies.append({
-                            "code": code, "type": "trend",
-                            "direction": "increasing" if slope > 0 else "decreasing",
-                            "monthly_slope": round(slope, 2),
-                            "annual_drift_pct": round(float(slope * 12 / mean_val * 100), 2),
-                            "severity": "high" if abs(slope * 12 / mean_val) > 0.30 else "medium",
-                        })
-
-                # 3. Volatilite (CV > 30%)
-                if _np.mean(actual_arr) != 0:
-                    cv = float(_np.std(actual_arr) / abs(_np.mean(actual_arr)) * 100)
-                    if cv > 30:
-                        anomalies.append({
-                            "code": code, "type": "high_volatility",
-                            "cv_pct": round(cv, 2),
-                            "min_month": mcols[int(_np.argmin(actual_arr))],
-                            "max_month": mcols[int(_np.argmax(actual_arr))],
-                            "min_val": round(float(_np.min(actual_arr)), 2),
-                            "max_val": round(float(_np.max(actual_arr)), 2),
-                            "severity": "high" if cv > 50 else "medium",
-                        })
-
-                # 4. Mois non budgete
-                for i, m in enumerate(mcols):
-                    if budget_arr[i] == 0 and actual_arr[i] != 0:
-                        anomalies.append({
-                            "code": code, "type": "unbudgeted_month", "month": m,
-                            "actual": round(float(actual_arr[i]), 2),
-                            "severity": "medium",
-                        })
-
-                # 5. Inversion de signe
-                for i, m in enumerate(mcols):
-                    if budget_arr[i] != 0 and actual_arr[i] != 0:
-                        if (budget_arr[i] > 0) != (actual_arr[i] > 0):
-                            anomalies.append({
-                                "code": code, "type": "sign_reversal", "month": m,
-                                "budget": round(float(budget_arr[i]), 2),
-                                "actual": round(float(actual_arr[i]), 2),
-                                "severity": "high",
-                            })
-            return anomalies
-
-        monthly_anomalies = _gen_fn("detect_monthly_anomalies",
-            lambda: _detect_anomalies(budget_df, actual_df, month_cols),
-            execution_log)
-
-        # ══════════════════════════════════════════════════════════════════
-        #   P H A S E   1  :  D E C O R T I C A G E   S Y S T E M A T I Q U E
-        # ══════════════════════════════════════════════════════════════════
-
-        def _build_monthly_profiles(monthly_vars, mcols):
-            profiles = {}
-            for mv in monthly_vars:
-                code = mv["code"]
-                if code not in profiles:
-                    profiles[code] = {
-                        "months_with_variance": 0,
-                        "variances": [],
-                        "actuals": [],
-                        "pct_variances": [],
-                    }
-                if mv["variance"] != 0:
-                    profiles[code]["months_with_variance"] += 1
-                profiles[code]["variances"].append(mv["variance"])
-                profiles[code]["actuals"].append(mv["actual"])
-                if mv["pct_variance"] is not None:
-                    profiles[code]["pct_variances"].append(mv["pct_variance"])
-            for code, p in profiles.items():
-                vals = _np.array(p["actuals"])
-                if len(vals) >= 6 and _np.std(vals) > 0:
-                    x = _np.arange(len(vals))
-                    slope = float(_np.polyfit(x, vals, 1)[0])
-                    mean_val = float(_np.mean(vals))
-                    p["slope"] = slope
-                    p["pct_drift"] = round(slope * 12 / mean_val * 100, 2) if mean_val != 0 else 0
-                else:
-                    p["slope"] = 0
-                    p["pct_drift"] = 0
-                big_months = sum(1 for pv in p["pct_variances"] if abs(pv) > 20)
-                p["months_significant"] = big_months
-            return profiles
-
-        profiles = _gen_fn("build_monthly_profiles",
-            lambda: _build_monthly_profiles(monthly_variances, month_cols),
-            execution_log)
-
-        NATURE_MAP = {
-            "monthly_spike":    "temporelle",
-            "trend":            "comportementale",
-            "high_volatility":  "comportementale",
-            "unbudgeted_month": "temporelle",
-            "sign_reversal":    "donnee",
-            "annual_variance":  "structurelle",
-        }
-        ORIGINE_MAP = {
-            "unbudgeted_month": "planification",
-            "sign_reversal":    "erreur_potentielle",
-            "trend":            "operationnel",
-            "high_volatility":  "operationnel",
-            "monthly_spike":    "saisonnier",
-        }
-
-        def _classify_origine(a):
-            atype = a.get("type", "annual_variance")
-            if atype in ORIGINE_MAP:
-                return ORIGINE_MAP[atype]
-            pct = abs(a.get("pct_variance", 0))
-            if pct > 100:
-                return "planification"
-            return "operationnel"
-
-        def _classify_frequence(code, profiles_dict, atype):
-            if atype == "annual_variance":
-                return "annuelle"
-            p = profiles_dict.get(code, {})
-            n = p.get("months_with_variance", 0)
-            if n <= 1:
-                return "ponctuelle"
-            elif n <= 3:
-                return "occasionnelle"
-            else:
-                return "recurrente"
-
-        def _classify_tendance(code, profiles_dict, atype):
-            if atype in ("sign_reversal", "unbudgeted_month"):
-                return "indeterminee"
-            p = profiles_dict.get(code, {})
-            drift = p.get("pct_drift", 0)
-            if abs(drift) < 5:
-                return "stable"
-            elif drift > 15:
-                return "croissante"
-            elif drift > 0:
-                return "legerement_croissante"
-            elif drift < -15:
-                return "decroissante"
-            else:
-                return "legerement_decroissante"
-
-        def _classify_portee(level):
-            if level == 0:
-                return "racine"
-            elif level == 1:
-                return "intermediaire"
-            else:
-                return "feuille"
-
-        def _phase1_decorticage(vtree, monthly_anoms, profiles_dict, merged_df):
-            unified = []
-            for v in vtree:
-                pct = v.get("pct_variance")
-                if pct is None or pct == 0:
-                    continue
-                code = v["code"]
-                level = v["level"]
-                a = {
-                    "source": "annual",
-                    "type": "annual_variance",
-                    "code": code,
-                    "level": level,
-                    "parent_code": v["parent_code"],
-                    "total_budget": v["total_budget"],
-                    "total_actual": v["total_actual"],
-                    "variance": v["variance"],
-                    "pct_variance": round(pct, 2),
-                    "new_or_unplanned": v.get("new_or_unplanned_activity", False),
-                    "nature":    NATURE_MAP["annual_variance"],
-                    "origine":   _classify_origine({"type": "annual_variance", "pct_variance": pct}),
-                    "frequence": _classify_frequence(code, profiles_dict, "annual_variance"),
-                    "tendance":  _classify_tendance(code, profiles_dict, "annual_variance"),
-                    "portee":    _classify_portee(level),
-                }
-                unified.append(a)
-            for ma in monthly_anoms:
-                code = ma.get("code", "?")
-                a = {**ma, "source": "monthly"}
-                match = merged_df[merged_df["code"] == code]
-                if not match.empty:
-                    a["level"] = int(match.iloc[0]["level"])
-                    a["parent_code"] = str(match.iloc[0]["parent_code"])
-                else:
-                    a["level"] = 2
-                    a["parent_code"] = ""
-                atype = a.get("type", "")
-                level = a["level"]
-                a["nature"]    = NATURE_MAP.get(atype, "donnee")
-                a["origine"]   = _classify_origine(a)
-                a["frequence"] = _classify_frequence(code, profiles_dict, atype)
-                a["tendance"]  = _classify_tendance(code, profiles_dict, atype)
-                a["portee"]    = _classify_portee(level)
-                unified.append(a)
-            return unified
-
-        all_anomalies = _gen_fn("phase1_decorticage",
-            lambda: _phase1_decorticage(
-                variance_tree, monthly_anomalies, profiles, merged),
-            execution_log)
-
-        # ══════════════════════════════════════════════════════════════════
-        #   P H A S E   2  :  S C O R I N G   5   A X E S  (1-100)
-        #              PAS DE SEUIL — SUGGESTION UNIQUEMENT
-        # ══════════════════════════════════════════════════════════════════
-
-        total_budget_abs = float(abs(merged["total_budget"].sum())) if len(merged) > 0 else 1.0
-        if total_budget_abs == 0:
-            total_budget_abs = 1.0
-
-        def _phase2_scoring(anomalies, total_budget_abs_val):
-            TYPE_URGENCE_BASE = {
-                "sign_reversal": 18, "monthly_spike": 15,
-                "trend": 12, "high_volatility": 10,
-                "annual_variance": 10, "unbudgeted_month": 8,
-            }
-            FREQ_SCORES = {
-                "recurrente": 15, "occasionnelle": 10,
-                "annuelle": 8, "ponctuelle": 5,
-            }
-            TENDANCE_SCORES = {
-                "croissante": 15, "legerement_croissante": 10,
-                "stable": 7, "indeterminee": 7,
-                "legerement_decroissante": 4, "decroissante": 2,
-            }
-            PORTEE_SCORES = {"racine": 15, "intermediaire": 10, "feuille": 5}
-
-            scored = []
-            for a in anomalies:
-                atype = a.get("type", "annual_variance")
-                sev = a.get("severity", "medium")
-
-                # Pilier 1 : Impact Financier (0-30)
-                p1 = 0.0
-                abs_var = abs(a.get("variance", 0))
-                abs_pct = abs(a.get("pct_variance",
-                    a.get("pct", a.get("annual_drift_pct", a.get("cv_pct", 0)))))
-                if total_budget_abs_val > 0:
-                    p1 += min(round(abs_var / total_budget_abs_val * 100 * 3, 1), 15)
-                p1 += min(round(abs_pct / 10, 1), 10)
-                if a.get("new_or_unplanned") or atype == "unbudgeted_month":
-                    p1 += 5
-                p1 = round(min(p1, 30), 1)
-
-                # Pilier 2 : Urgence (0-25)
-                p2 = float(TYPE_URGENCE_BASE.get(atype, 10))
-                if sev == "high":
-                    p2 += 5
-                elif sev == "medium":
-                    p2 += 2
-                p2 = round(min(p2, 25), 1)
-
-                # Pilier 3 : Frequence (0-15)
-                p3 = float(FREQ_SCORES.get(a.get("frequence", "ponctuelle"), 5))
-
-                # Pilier 4 : Tendance (0-15)
-                p4 = float(TENDANCE_SCORES.get(a.get("tendance", "stable"), 7))
-
-                # Pilier 5 : Portee (0-15)
-                p5 = float(PORTEE_SCORES.get(a.get("portee", "feuille"), 5))
-
-                total = round(min(p1 + p2 + p3 + p4 + p5, 100))
-
-                if total >= 80:
-                    niveau = "critique"
-                elif total >= 60:
-                    niveau = "majeur"
-                else:
-                    niveau = "mineur"
-
-                # SUGGESTION (guidance pour le LLM, PAS un filtre)
-                if total >= 65:
-                    suggestion = "fortement_recommande"
-                elif total >= 40:
-                    suggestion = "a_evaluer"
-                else:
-                    suggestion = "probablement_negligeable"
-
-                a["scoring"] = {
-                    "impact_financier": p1,
-                    "urgence": p2,
-                    "frequence": p3,
-                    "tendance": p4,
-                    "portee": p5,
-                }
-                a["score"] = total
-                a["niveau"] = niveau
-                a["suggestion"] = suggestion
-                scored.append(a)
-
-            return sorted(scored, key=lambda x: x["score"], reverse=True)
-
-        all_scored = _gen_fn("phase2_scoring",
-            lambda: _phase2_scoring(all_anomalies, total_budget_abs),
-            execution_log)
-
-        # Stats de scoring (pas de filtre — juste des stats)
-        scoring_stats = _gen_fn("compute_scoring_stats", lambda: {
-            "total_scored": len(all_scored),
-            "fortement_recommande": sum(
-                1 for a in all_scored if a["suggestion"] == "fortement_recommande"),
-            "a_evaluer": sum(
-                1 for a in all_scored if a["suggestion"] == "a_evaluer"),
-            "probablement_negligeable": sum(
-                1 for a in all_scored if a["suggestion"] == "probablement_negligeable"),
-            "score_max": max((a["score"] for a in all_scored), default=0),
-            "score_min": min((a["score"] for a in all_scored), default=0),
-            "score_mean": round(
-                sum(a["score"] for a in all_scored) / max(len(all_scored), 1), 1),
-            "critiques": sum(1 for a in all_scored if a["niveau"] == "critique"),
-            "majeurs": sum(1 for a in all_scored if a["niveau"] == "majeur"),
-            "mineurs": sum(1 for a in all_scored if a["niveau"] == "mineur"),
-        }, execution_log)
-
-        # ══════════════════════════════════════════════════════════════════
-        #   FORMAT TOUTES les anomalies en cartes (le LLM triera)
-        # ══════════════════════════════════════════════════════════════════
-
-        def _format_all_cards(scored_list):
-            cards = []
-            for idx, a in enumerate(scored_list, 1):
-                anomalie_id = f"ANM-{idx:03d}"
-                code = a.get("code", "?")
-                source = a.get("source", "?")
-                atype = a.get("type", "annual_variance")
-                score = a["score"]
-                niveau = a["niveau"]
-                scoring = a.get("scoring", {})
-                suggestion = a.get("suggestion", "a_evaluer")
-
-                if source == "annual":
-                    pct = a.get("pct_variance", 0)
-                    var = a.get("variance", 0)
-                    resume = (
-                        f"Compte {code} : ecart annuel de "
-                        f"{var:+,.0f} ({pct:+.1f}%) vs budget"
-                    )
-                elif atype == "monthly_spike":
-                    resume = (
-                        f"Compte {code} : spike {a.get('month','')} "
-                        f"({a.get('pct', 0):+.1f}%)"
-                    )
-                elif atype == "trend":
-                    resume = (
-                        f"Compte {code} : tendance {a.get('direction','')} "
-                        f"(drift {a.get('annual_drift_pct', 0):+.1f}%/an)"
-                    )
-                elif atype == "high_volatility":
-                    resume = (
-                        f"Compte {code} : volatilite excessive "
-                        f"(CV={a.get('cv_pct', 0):.0f}%)"
-                    )
-                elif atype == "sign_reversal":
-                    resume = f"Compte {code} : inversion de signe {a.get('month','')}"
-                elif atype == "unbudgeted_month":
-                    resume = (
-                        f"Compte {code} : activite non budgetee "
-                        f"{a.get('month','')} ({a.get('actual', 0):,.0f})"
-                    )
-                else:
-                    resume = f"Compte {code} : anomalie {atype}"
-
-                top_pilier = max(
-                    scoring.items(), key=lambda x: x[1]
-                ) if scoring else ("?", 0)
-
-                cards.append({
-                    "anomalie_id": anomalie_id,
-                    "code": code,
-                    "source": source,
-                    "type": atype,
-                    "resume": resume,
-                    "score": score,
-                    "niveau": niveau,
-                    "suggestion": suggestion,
-                    "nature": a.get("nature", "?"),
-                    "origine": a.get("origine", "?"),
-                    "frequence": a.get("frequence", "?"),
-                    "tendance": a.get("tendance", "?"),
-                    "portee": a.get("portee", "?"),
-                    "scoring_detail": scoring,
-                    "pilier_dominant": f"{top_pilier[0]} ({top_pilier[1]:.0f}pts)",
-                    "donnees": {
-                        k: v for k, v in a.items()
-                        if k not in (
-                            "score", "scoring", "niveau", "source", "suggestion",
-                            "nature", "origine", "frequence", "tendance", "portee"
-                        )
-                    },
-                })
-            return cards
-
-        all_cards = _gen_fn("format_all_cards",
-            lambda: _format_all_cards(all_scored), execution_log)
-
-        # ══════════════════════════════════════════════════════════════
-        # ── RESULTAT (TOUTES les cartes, pas de filtre) ───────────────
-        # ══════════════════════════════════════════════════════════════
-        stats = {
-            "total_accounts": len(variance_tree),
-            "root_accounts": sum(1 for v in variance_tree if v["level"] == 0),
-            "leaf_accounts": sum(1 for v in variance_tree if v["level"] > 0),
-            "drivers_count": len(drivers),
-            "unplanned_count": sum(
-                1 for v in variance_tree if v["new_or_unplanned_activity"]),
-            "total_anomalies_scored": len(all_scored),
-            "functions_executed": len(execution_log),
-        }
-
-        result = {
-            "status": "success",
-            "stage": "anomaly_analysis",
-            "all_anomaly_cards": all_cards,
-            "scoring_stats": scoring_stats,
-            "variance_tree": variance_tree,
-            "drivers": drivers,
-            "monthly_variances": monthly_variances,
-            "validation": validation,
-            "execution_log": execution_log,
-            "stats": stats,
-            "triage_status": "pending",  # sera mis a jour par save_triage_decisions
-        }
-
-        tool_context.state["a3_output"] = _to_native(result)
-        logger.info(
-            "A3 Phase 1+2 OK : %d comptes, %d anomalies scorees "
-            "(%d recomm, %d a_eval, %d negli), %d fns — TRIAGE LLM EN ATTENTE",
-            len(variance_tree), len(all_scored),
-            scoring_stats.get("fortement_recommande", 0),
-            scoring_stats.get("a_evaluer", 0),
-            scoring_stats.get("probablement_negligeable", 0),
-            len(execution_log),
-        )
-
-        # Retourner un resume compact pour le LLM (pas toutes les cartes
-        # detaillees — seulement les fortement_recommande + a_evaluer
-        # en detail, et un resume des negligeables)
-        cards_for_review = [
-            c for c in all_cards if c["suggestion"] != "probablement_negligeable"
-        ]
-        negligeable_summary = {
-            "count": sum(1 for c in all_cards if c["suggestion"] == "probablement_negligeable"),
-            "score_range": f"0-39",
-            "examples": [
-                {"id": c["anomalie_id"], "code": c["code"], "score": c["score"],
-                 "resume": c["resume"][:50]}
-                for c in all_cards if c["suggestion"] == "probablement_negligeable"
-            ][:5],  # max 5 exemples
-        }
-
-        return _to_native({
-            "status": "success",
-            "stage": "anomaly_analysis_phase1_2",
-            "stats": stats,
-            "scoring_stats": scoring_stats,
-            "validation": validation,
-            "cards_to_review": cards_for_review,
-            "negligeable_summary": negligeable_summary,
-            "message": (
-                f"Phase 1+2 terminee. {len(all_scored)} anomalies scorees. "
-                f"{scoring_stats.get('fortement_recommande', 0)} fortement recommandees, "
-                f"{scoring_stats.get('a_evaluer', 0)} a evaluer, "
-                f"{scoring_stats.get('probablement_negligeable', 0)} negligeables. "
-                f"APPELLE save_triage_decisions avec tes verdicts."
-            ),
-        })
-
-    except Exception as exc:
-        logger.error("A3 exception : %s\n%s", exc, _tb.format_exc())
-        result = {
-            "status": "error",
-            "stage": "anomaly_analysis",
-            "errors": [f"Exception inattendue : {exc}"],
-            "execution_log": execution_log,
-        }
-        tool_context.state["a3_output"] = _to_native(result)
-        return _to_native(result)
 
 def normalize_pnl_files(tool_context: ToolContext) -> dict:
     """Charge, valide et nettoie les 3 fichiers CSV P&L.
@@ -1018,32 +138,24 @@ def normalize_pnl_files(tool_context: ToolContext) -> dict:
     errors: List[str] = []
 
     # ── 1. Charger les CSV ────────────────────────────────────────────
-    files = {
-        "budget":  None,
-        "actual":  None,
-        "mapping": None,
-    }
-    
+    # ── Read from Streamlit uploaded files (not local paths) ────────
     uploaded_files = tool_context.state.get("briefing", {}).get("uploaded_files", [])
-    
-    # Classify uploads
+    file_map = {"budget": None, "actual": None, "mapping": None}
     for f in uploaded_files:
         lower = str(f.name).lower()
         if any(k in lower for k in ["budget", "prevision", "forecast"]):
-            files["budget"] = f
+            file_map["budget"] = f
         elif any(k in lower for k in ["actual", "real", "resultat", "reel"]):
-            files["actual"] = f
+            file_map["actual"] = f
         elif any(k in lower for k in ["mapping", "chart", "accounts", "coa"]):
-            files["mapping"] = f
+            file_map["mapping"] = f
 
     dfs: Dict[str, Any] = {}
-
-    for name, f in files.items():
+    for name, f in file_map.items():
         if f is None:
             if name != "mapping":
                 errors.append(f"Fichier manquant (upload) : {name}")
             continue
-            
         try:
             content = f.getvalue()
             fname_lower = str(f.name).lower()
@@ -1053,18 +165,23 @@ def normalize_pnl_files(tool_context: ToolContext) -> dict:
                 df = pd.read_excel(BytesIO(content))
             else:
                 df = pd.read_csv(BytesIO(content))
-                
             df.columns = [str(c).strip().lower() for c in df.columns]
             dfs[name] = df
         except Exception as exc:
             errors.append(f"Erreur lecture {name} ({f.name}) : {exc}")
 
+    # Fallbacks
     if "budget" not in dfs and "actual" in dfs:
         dfs["budget"] = dfs["actual"].copy()
     if "actual" not in dfs and "budget" in dfs:
         dfs["actual"] = dfs["budget"].copy()
     if "mapping" not in dfs:
         dfs["mapping"] = pd.DataFrame(columns=A1_REQUIRED_COLS["mapping"])
+
+    if errors:
+        result = {"status": "error", "stage": "structural_validation", "errors": errors}
+        tool_context.state["a1_output"] = result
+        return result
 
     budget_df = dfs["budget"]
     actual_df = dfs["actual"]
@@ -1188,6 +305,13 @@ def normalize_pnl_files(tool_context: ToolContext) -> dict:
         "hierarchy_edges": G.number_of_edges() if "parent_code" in mapping_df.columns else 0,
         "message": "Les 3 fichiers CSV sont valides et nettoyés. Agrégats exclus. Hiérarchie validée (aucun cycle)."
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LlmAgent : A1_Normalizer (Day 1b §3)
+# ════════════════════════════════════════════════════════════════════════════
+
+
 
 def classify_pnl_accounts(tool_context: ToolContext) -> dict:
     """Classifie les comptes P&L et contrôle la matérialité financière.
@@ -1341,6 +465,13 @@ def classify_pnl_accounts(tool_context: ToolContext) -> dict:
         tool_context.state["a2_output"] = result
         return result
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LlmAgent : A2_Classifier (Day 1b §3 + Day 1b §4)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+
 def analyze_pnl_variances(tool_context: ToolContext) -> dict:
     """Analyse P&L robuste : decorticage + scoring 5 axes. AUCUN filtre.
 
@@ -2194,6 +1325,14 @@ def analyze_pnl_variances(tool_context: ToolContext) -> dict:
         tool_context.state["a3_output"] = _to_native(result)
         return _to_native(result)
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TOOL 2 : save_triage_decisions
+#  Phase 3 — Le LLM persiste ses decisions RETENIR / ECARTER
+# ════════════════════════════════════════════════════════════════════════════
+
+
+
 def save_triage_decisions(
     tool_context: ToolContext,
     decisions: list[dict],
@@ -2296,6 +1435,13 @@ def save_triage_decisions(
             f"Donnees prete pour le Reporter."
         ),
     })
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  LlmAgent : A3_Anomaly_Analyser (v4 — Triage LLM)
+# ════════════════════════════════════════════════════════════════════════════
+
+
 
 def load_analysis_results(tool_context: ToolContext) -> dict:
     """Charge et structure les résultats des agents A1, A2 et A3 pour le rapport.
@@ -2509,22 +1655,6 @@ def load_analysis_results(tool_context: ToolContext) -> dict:
 #  Utilise UNIQUEMENT le custom tool load_analysis_results.
 # ════════════════════════════════════════════════════════════════════════════
 
-A4_LOADER_INSTRUCTION = """Tu es un assistant de préparation de données.
-Ta seule mission : appeler l'outil load_analysis_results pour récupérer
-et structurer les résultats des agents A1, A2 et A3, ainsi que le feedback
-des évaluations qualité passées (A5_Quality_Judge).
-
-Étapes :
-1. Appelle load_analysis_results immédiatement.
-2. Si le status retourné est "success", confirme brièvement :
-   nombre d'anomalies retenues, budget total, réalisé total.
-3. Si le briefing contient un champ "judge_feedback" avec has_feedback=true,
-   SIGNALE les faiblesses récurrentes et le dernier score qualité.
-   Résume-les clairement pour que le sous-agent suivant les prenne en compte.
-4. Si le status est "error", rapporte l'erreur telle quelle.
-
-Tu ne fais RIEN d'autre : pas d'analyse, pas de rapport, pas de recherche.
-"""
 
 
 def _detect_report_redundancies(report_text: str, anomalies: list) -> dict:
@@ -2594,6 +1724,15 @@ def _detect_report_redundancies(report_text: str, anomalies: list) -> dict:
         "details": redundancy_details,
         "total_sections_analyzed": len(sections),
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TOOL : load_report_for_judging (custom)
+#  Charge le rapport A4, le briefing source, les anomalies A3,
+#  détecte les redondances, et charge l'historique des évaluations.
+# ════════════════════════════════════════════════════════════════════════════
+
+
 
 def load_report_for_judging(tool_context: ToolContext) -> dict:
     """Charge le rapport A4 et les données source pour évaluation qualité.
@@ -2727,4 +1866,8 @@ def load_report_for_judging(tool_context: ToolContext) -> dict:
 
     return judging_package
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  INSTRUCTION A5 : LLM-as-a-Judge
+# ════════════════════════════════════════════════════════════════════════════
 
